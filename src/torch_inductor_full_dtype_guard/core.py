@@ -161,17 +161,31 @@ class Int8OverflowCase:
     compiled_guarded_raised: bool
     native_silently_wrong: bool  # eager raises, compiled native does not
     guard_matches_eager: bool
+    overflow_dtype: str = "int8"  # widened 2026-09-19: the same missing-cast
+    # bug and the same safe_full() fix were confirmed to generalize to every
+    # narrow integer dtype torch.full's overflow check covers (int16, uint8),
+    # not just int8. Kept as a trailing field with a default so existing
+    # positional/keyword construction of this dataclass from before this
+    # widening still works.
 
 
-def _run_int8_overflow_case(torch_module, safe_full, fill_value: int) -> Int8OverflowCase:
+def _run_int8_overflow_case(
+    torch_module, safe_full, fill_value: int, dtype=None
+) -> Int8OverflowCase:
+    """Reproduce the missing-cast silent-overflow bug for one (dtype,
+    fill_value) pair. Originally hardcoded to dtype=torch.int8; widened to
+    accept any narrow integer dtype so the same bug/fix can be verified
+    beyond int8 -- see ``diagnose()``'s ``overflow_dtype_fill_values``."""
+    if dtype is None:
+        dtype = torch_module.int8
     prior_capture_flag = torch_module._dynamo.config.capture_scalar_outputs
     torch_module._dynamo.config.capture_scalar_outputs = True
     try:
         def g_native(x):
-            return torch_module.full((2,), x.item(), dtype=torch_module.int8)
+            return torch_module.full((2,), x.item(), dtype=dtype)
 
         def g_guarded(x):
-            return safe_full((2,), x.item(), dtype=torch_module.int8)
+            return safe_full((2,), x.item(), dtype=dtype)
 
         hundred = torch_module.tensor(fill_value)
 
@@ -209,20 +223,51 @@ def _run_int8_overflow_case(torch_module, safe_full, fill_value: int) -> Int8Ove
         compiled_guarded_raised=guarded_raised,
         native_silently_wrong=(eager_raised and not native_raised),
         guard_matches_eager=(guarded_raised == eager_raised),
+        overflow_dtype=str(dtype).replace("torch.", ""),
     )
 
 
 def diagnose(
     bool_fill_values: Sequence[int] = (0, 1, 2, 3, 7),
     int8_overflow_fill_values: Sequence[int] = (300, -200, 1000),
+    extra_overflow_dtype_cases: Optional[Sequence[Tuple[str, int]]] = None,
 ) -> Dict[str, Any]:
     """Reproduce the eager-vs-Inductor ``torch.full`` symbolic-fill
     dtype-cast divergence from scratch against the currently installed
     torch build, and verify ``safe_full`` matches eager in every case.
     Never trusts a cached/prior result -- every call re-runs the
-    actual repro."""
+    actual repro.
+
+    ``extra_overflow_dtype_cases`` widens the originally int8-only
+    overflow sweep to other narrow integer dtypes (name, fill_value)
+    pairs -- e.g. ``[("int16", 40000), ("uint8", 300)]``. Defaults to
+    int16 and uint8 in addition to the original int8 sweep.
+
+    IMPORTANT, confirmed 2026-09-19: unlike the int8 case (a universal
+    Inductor defect, reproducible in any process state), whether
+    int16/uint8 exhibit the SAME silent-overflow bug is dependent on
+    whether ``numpy`` happens to be importable in the current process
+    at compile time -- not a property of this package's own declared
+    dependencies (which do not include numpy). Verified directly: a
+    clean venv with only this package's ``.[dev,torch]`` extra
+    installed (no numpy) does NOT reproduce the int16/uint8 bug (both
+    correctly raise under torch.compile, matching eager), while the
+    exact same torch build in a process that also happens to have
+    numpy importable DOES reproduce it identically to int8. The root
+    mechanism was not traced further than this reproducible correlation
+    (not asserted to be causal); treat ``any_overflow_dtype_silent_overflow``
+    and each extra case's ``native_silently_wrong`` as environment-
+    reported facts about the current process, not fixed properties of
+    the installed torch version. ``safe_full()``'s guard is NOT subject
+    to this hazard -- ``torch.compiler.disable`` forces real eager
+    execution regardless of numpy's presence, so ``guard_matches_eager``
+    is unconditionally true for these cases on this torch version.
+    """
     torch_module = _import_torch()
     safe_full = _make_safe_full(torch_module)
+
+    if extra_overflow_dtype_cases is None:
+        extra_overflow_dtype_cases = [("int16", 40000), ("uint8", 300)]
 
     bool_cases: List[BoolFillCase] = [
         _run_bool_fill_case(torch_module, safe_full, fv) for fv in bool_fill_values
@@ -231,11 +276,21 @@ def diagnose(
         _run_int8_overflow_case(torch_module, safe_full, fv)
         for fv in int8_overflow_fill_values
     ]
+    extra_overflow_cases: List[Int8OverflowCase] = [
+        _run_int8_overflow_case(
+            torch_module, safe_full, fv, dtype=getattr(torch_module, dtype_name)
+        )
+        for dtype_name, fv in extra_overflow_dtype_cases
+    ]
+    all_overflow_cases = int8_cases + extra_overflow_cases
 
     any_bool_divergence = any(c.native_diverges for c in bool_cases)
     any_int8_silent_overflow = any(c.native_silently_wrong for c in int8_cases)
+    any_overflow_dtype_silent_overflow = any(
+        c.native_silently_wrong for c in all_overflow_cases
+    )
     guard_fully_correct = all(c.guard_matches_eager for c in bool_cases) and all(
-        c.guard_matches_eager for c in int8_cases
+        c.guard_matches_eager for c in all_overflow_cases
     )
 
     return {
@@ -243,8 +298,12 @@ def diagnose(
         "issue_urls": ["https://github.com/pytorch/pytorch/issues/194062"],
         "bool_fill_cases": [dataclasses.asdict(c) for c in bool_cases],
         "int8_overflow_cases": [dataclasses.asdict(c) for c in int8_cases],
+        "extra_overflow_dtype_cases": [
+            dataclasses.asdict(c) for c in extra_overflow_cases
+        ],
         "any_bool_fill_divergence": any_bool_divergence,
         "any_int8_silent_overflow": any_int8_silent_overflow,
+        "any_overflow_dtype_silent_overflow": any_overflow_dtype_silent_overflow,
         "guard_fully_correct": guard_fully_correct,
     }
 

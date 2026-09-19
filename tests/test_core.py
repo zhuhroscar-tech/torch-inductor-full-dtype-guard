@@ -129,6 +129,80 @@ class TestSafeFullMatchesEager:
         assert guarded.dtype == torch.int64
 
 
+class TestExtraOverflowDtypes:
+    """2026-09-19: investigated whether the missing-cast overflow bug
+    generalizes beyond int8 to other narrow integer dtypes (int16, uint8).
+
+    Real finding: it is NUMPY-PROCESS-STATE DEPENDENT, not a universal
+    Inductor defect like the int8 case. In a clean venv with only
+    `.[dev,torch]` installed (matching this repo's actual declared deps
+    and this CI workflow's install step -- no numpy), torch.compile
+    correctly raises for symbolic int16/uint8 overflow fills, matching
+    eager: NO bug. But if numpy happens to be importable in the same
+    process (observed on this macOS host's system Python, which has
+    numpy 2.5.2 on sys.path for unrelated reasons), the exact same
+    int16/uint8 fills DO silently skip the overflow check exactly like
+    int8 always does. Confirmed by isolating both environments directly
+    (venv without numpy vs. system Python with numpy) rather than
+    inferring this from one run.
+
+    Given that dependency, the regression coverage here intentionally
+    does NOT assert the buggy outcome unconditionally -- doing so would
+    make this suite non-deterministic across CI runners depending on
+    whichever transitive/incidental packages happen to be importable.
+    What IS asserted, and IS environment-independent: (1) the widened
+    report shape always includes int16/uint8 cases, and (2)
+    safe_full()'s guard matches eager in either environment state,
+    because torch.compiler.disable forces the real eager overflow
+    check regardless of whether numpy is present -- the guard's
+    correctness does not depend on this hazard, only the NATIVE
+    (unguarded) bug's presence does.
+    """
+
+    def test_diagnose_default_includes_int16_and_uint8_overflow_cases(self):
+        report = diagnose(bool_fill_values=(3,), int8_overflow_fill_values=(300,))
+        dtypes_seen = {c["overflow_dtype"] for c in report["extra_overflow_dtype_cases"]}
+        assert dtypes_seen == {"int16", "uint8"}
+
+    def test_int16_overflow_guard_matches_eager_regardless_of_native_outcome(self):
+        report = diagnose(
+            bool_fill_values=(3,),
+            int8_overflow_fill_values=(300,),
+            extra_overflow_dtype_cases=[("int16", 40000)],
+        )
+        case = report["extra_overflow_dtype_cases"][0]
+        assert case["overflow_dtype"] == "int16"
+        assert case["eager_raised"] is True
+        # native_silently_wrong is numpy-process-state dependent (see class
+        # docstring) -- not asserted here. The guard's correctness is not:
+        assert case["guard_matches_eager"] is True
+        assert case["compiled_guarded_raised"] == case["eager_raised"]
+
+    def test_uint8_overflow_guard_matches_eager_regardless_of_native_outcome(self):
+        report = diagnose(
+            bool_fill_values=(3,),
+            int8_overflow_fill_values=(300,),
+            extra_overflow_dtype_cases=[("uint8", 300)],
+        )
+        case = report["extra_overflow_dtype_cases"][0]
+        assert case["overflow_dtype"] == "uint8"
+        assert case["guard_matches_eager"] is True
+        assert case["compiled_guarded_raised"] == case["eager_raised"]
+
+    def test_any_overflow_dtype_silent_overflow_flag_is_well_defined(self):
+        # Whatever this host's numpy-process-state hazard resolves to, the
+        # flag must be a plain bool and must be consistent with the int8
+        # case (which IS a universal, numpy-independent bug) always being
+        # counted: since int8 is included by default, this must be True.
+        report = diagnose(bool_fill_values=(3,), int8_overflow_fill_values=(300,))
+        assert isinstance(report["any_overflow_dtype_silent_overflow"], bool)
+        assert report["any_overflow_dtype_silent_overflow"] is True
+
+    def test_guard_fully_correct_still_true_with_widened_dtype_sweep(self):
+        report = diagnose()
+        assert report["guard_fully_correct"] is True
+
+
 class TestDiagnose:
     def test_diagnose_runs_and_reports_consistent_structure(self):
         report = diagnose(bool_fill_values=(1, 3), int8_overflow_fill_values=(300,))

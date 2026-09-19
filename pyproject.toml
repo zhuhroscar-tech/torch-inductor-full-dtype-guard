@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "torch-inductor-full-dtype-guard"
-version = "0.1.0"
+version = "0.2.0"
 description = "Guards a real torch.compile(backend='inductor') bug: torch.full(size, fill_value, dtype=X) silently drops the dtype cast when fill_value is a symbolic/traced scalar, causing wrong bool-mask sums and a silently-skipped int8 overflow check"
 readme = "README.md"
 license = { text = "MIT" }

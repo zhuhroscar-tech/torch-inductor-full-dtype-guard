@@ -67,6 +67,11 @@ def main(argv=None) -> int:
     else:
         print(status_headline(style, "info", "no silent int8-overflow case reproduced on this host"))
 
+    if report.get("any_overflow_dtype_silent_overflow"):
+        print(status_headline(style, "fail", "at least one overflow case (int8, or int16/uint8 under this process's numpy state) silently skipped its check under torch.compile"))
+    else:
+        print(status_headline(style, "info", "no silent overflow case reproduced across the checked integer dtypes on this host/process"))
+
     if report["guard_fully_correct"]:
         print(status_headline(style, "ok", "safe_full() matches eager on every case, including under torch.compile"))
     else:
@@ -99,6 +104,23 @@ def main(argv=None) -> int:
                 )
             ]
         )
+
+    extra_cases = report.get("extra_overflow_dtype_cases") or []
+    if extra_cases:
+        section("additional narrow-integer-dtype overflow cases (int16/uint8; bug presence here is numpy-process-state dependent, see README)")
+        for c in extra_cases:
+            flag = "SILENTLY-WRONG" if c["native_silently_wrong"] else "ok"
+            guard_flag = "guard-ok" if c["guard_matches_eager"] else "GUARD-FAILED"
+            print_fields(
+                [
+                    (
+                        f"dtype={c.get('overflow_dtype', '?')} fill={c['fill_value']}",
+                        f"eager_raised={c['eager_raised']!s:5s}  compiled_native_raised={c['compiled_native_raised']!s:5s}  "
+                        f"compiled_guarded_raised={c['compiled_guarded_raised']!s:5s}  {flag:15s}  {guard_flag}",
+                    )
+                ]
+            )
+
 
     return 0 if report["guard_fully_correct"] else 1
 

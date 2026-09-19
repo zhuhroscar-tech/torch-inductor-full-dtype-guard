@@ -16,6 +16,8 @@ print(torch.compile(f, fullgraph=True)(torch.tensor(3)))  # inductor: tensor(6)
 
 A second symptom of the same missing cast is a silently-skipped safety check: `torch.full(size, 300, dtype=torch.int8)` raises `RuntimeError: value cannot be converted to type int8_t without overflow` in eager mode for a symbolic fill, but under `torch.compile(backend="inductor")` the same call silently succeeds and returns a meaningless wrapped-around int8 value instead.
 
+**The int8 overflow bug is universal; the same-looking bug in int16/uint8 is not.** Investigating whether this overflow-check gap extends to other narrow integer dtypes (int16, uint8) found something more interesting than a simple yes: whether the SAME code (`torch.full(size, out_of_range_symbolic_fill, dtype=torch.int16)`) silently skips the overflow check under Inductor depends on whether `numpy` happens to be importable in the *same process* at compile time -- a hazard that has nothing to do with this package's own dependencies (it does not require or import numpy). Verified directly on torch 2.14.0: a clean venv with only `pip install -e ".[dev,torch]"` (no numpy) does NOT reproduce the int16/uint8 bug -- both correctly raise, matching eager -- while the identical torch build in a process that also has numpy importable DOES reproduce it, identically to int8. The `torch-inductor-full-dtype-guard --json` output's `extra_overflow_dtype_cases` and `any_overflow_dtype_silent_overflow` fields report this as an observed fact about the *current process*, not a fixed property of the installed torch version -- do not assume a "no bug" result there generalizes to a process that happens to import numpy first. `safe_full()` is unaffected either way: `torch.compiler.disable` forces genuine eager execution regardless of numpy's presence.
+
 ## Install and check
 
 Requires Python 3.9+ and a compatible PyTorch installation (`torch>=2.0` in the optional extra).
@@ -30,7 +32,7 @@ torch-inductor-full-dtype-guard
 torch-inductor-full-dtype-guard --json
 ```
 
-The CLI reruns the divergence checks across several bool-fill values (0, 1, 2, 3, 7) and int8-overflow fill values (300, -200, 1000) against the currently installed torch build, and verifies the `safe_full` guard matches eager in every case. Its JSON includes the installed torch version, per-case results, `any_bool_fill_divergence`, `any_int8_silent_overflow`, and `guard_fully_correct`.
+The CLI reruns the divergence checks across several bool-fill values (0, 1, 2, 3, 7), int8-overflow fill values (300, -200, 1000), and additional narrow-integer-dtype overflow checks (int16, uint8) against the currently installed torch build, and verifies the `safe_full` guard matches eager in every case. Its JSON includes the installed torch version, per-case results, `any_bool_fill_divergence`, `any_int8_silent_overflow`, `extra_overflow_dtype_cases`, `any_overflow_dtype_silent_overflow` (numpy-process-state dependent, see above), and `guard_fully_correct`.
 
 Exit codes describe the **guard check**, not just native bug detection: `0` means every guard case matched eager, `1` means a guard check failed, and `2` means torch could not be imported.
 
